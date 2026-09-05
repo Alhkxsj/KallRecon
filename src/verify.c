@@ -84,7 +84,7 @@ void verify_kallsyms(void)
 
 	pr_info("[kallrecon] verify: bootstrapping...\n");
 
-	typedef void (*sno_t)(char *, unsigned long);
+	typedef int (*sno_t)(char *, unsigned long);
 	sno_t sno = (sno_t)kallsyms_name_to_addr("sprint_symbol_no_offset");
 	if (sno)
 		sno(truth, test_addr);
