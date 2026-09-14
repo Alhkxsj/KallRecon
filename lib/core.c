@@ -271,6 +271,113 @@ static int scan_zerou32(unsigned long start, unsigned long end,
 	return found;
 }
 
+#ifdef CONFIG_X86_64
+/* x86 5.10~6.12 ABSOLUTE_PERCPU stores normal symbols as rb-1-addr,
+ * which decreases as addresses increase; the forward ascending-run
+ * scanner cannot see it. walking backwards turns the same entries
+ * into an ascending run. rb (2MB aligned) may lead the run and is
+ * dropped by the same alignment check the forward scanner uses. */
+static int rev_commit(unsigned long cand, int len, int head,
+		      unsigned long *best_cand, int *best_len)
+{
+	unsigned long full = cand;
+	int pc = 0, pv = 0x7fffffff;
+
+	/* the percpu block sits at the low end: absolute small positive
+	 * addresses, non-increasing when walked backwards */
+	while (full >= 4 && pc < 100000) {
+		u32 v;
+		int vi;
+
+		if (safe_read(&v, (void *)(full - 4), 4))
+			break;
+		vi = (int)v;
+		if (vi < 0 || vi > 0x10000000 || vi > pv)
+			break;
+		pv = vi;
+		full -= 4;
+		pc++;
+	}
+
+	if (head != 0 && (head & 0x1FFFFF) == 0)
+		len--;
+
+	len += pc;
+	cand = full;
+	if (len < 5000)
+		return 0;
+
+	unsigned long rb, rb_addr;
+	if (verify_offsets_rb(cand, len, &rb, &rb_addr)) {
+		*best_cand = cand;
+		*best_len = len;
+		kloffs_addr = cand;
+		klnum_val = len;
+		klbase_addr = rb_addr;
+		klbase_val = rb;
+		ks_dbg("[kallrecon] hit rev pg=0x%lx sorted=%d\n",
+			(unsigned long)(cand & ~0xFFFULL), len);
+		return 1;
+	}
+	if (len > 5000 && verify_offsets_rb(cand, len - 1, &rb, &rb_addr)) {
+		*best_cand = cand;
+		*best_len = len - 1;
+		kloffs_addr = cand;
+		klnum_val = len - 1;
+		klbase_addr = rb_addr;
+		klbase_val = rb;
+		ks_dbg("[kallrecon] hit rev pg=0x%lx sorted=%d (len-1)\n",
+			(unsigned long)(cand & ~0xFFFULL), len);
+		return 1;
+	}
+	ks_dbg("[kallrecon] rev cand REJECT\n");
+	return 0;
+}
+
+static int scan_zerou32_rev(unsigned long start, unsigned long end,
+			    unsigned long *best_cand, int *best_len)
+{
+	unsigned long pos = end;
+	unsigned long cand = 0;
+	int len = 0, prev = 0, head = 0;
+
+	while (pos > start) {
+		unsigned long lo = pos - start > 64 * 1024 ?
+			pos - 64 * 1024 : start;
+		unsigned int n = (unsigned int)((pos - lo) / 4);
+		int i;
+
+		if (!n)
+			break;
+		if (safe_read(slide_buf, (void *)lo, n * 4))
+			break;
+
+		for (i = (int)n - 1; i >= 0; i--) {
+			u32 v = slide_buf[i];
+			unsigned long addr = lo + (unsigned long)i * 4;
+
+			if (len && (int)v < prev) {
+				if (len >= 5000 &&
+				    rev_commit(cand, len, head,
+					       best_cand, best_len))
+					return 1;
+				len = 0;
+			}
+			if (!len)
+				head = (int)v;
+			prev = (int)v;
+			cand = addr;
+			len++;
+		}
+		pos = lo;
+	}
+
+	if (len >= 5000 && rev_commit(cand, len, head, best_cand, best_len))
+		return 1;
+	return 0;
+}
+#endif
+
 static int discover_kallsyms(unsigned long ti_addr)
 {
 	unsigned long best_cand = 0;
@@ -310,6 +417,11 @@ static int discover_kallsyms(unsigned long ti_addr)
 
 	if (scan_zerou32(scan_start, scan_end, &best_cand, &best_len))
 		goto found;
+
+#ifdef CONFIG_X86_64
+	if (scan_zerou32_rev(scan_start, scan_end, &best_cand, &best_len))
+		goto found;
+#endif
 
 	ks_dbg("[kallrecon] no offsets found\n");
 	return 0;
