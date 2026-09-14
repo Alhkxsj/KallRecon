@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/printk.h>
 #include "../lib/core.h"
+#include "dbg.h"
 
 void sprint_symbol(char *buf, unsigned long addr);
 
