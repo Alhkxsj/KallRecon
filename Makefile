@@ -1,5 +1,11 @@
-kallrecon-objs := src/main.o lib/core.o lib/slide.o lib/anchor.o src/verify.o
-test_probe-objs := test/test_main.o test/dbg.o lib/core.o lib/slide.o lib/anchor.o
+ifeq ($(ARCH),x86_64)
+ANCHOR := lib/anchor_x86.o
+else
+ANCHOR := lib/anchor.o
+endif
+
+kallrecon-objs := src/main.o lib/core.o lib/slide.o $(ANCHOR) src/verify.o
+test_probe-objs := test/test_main.o test/dbg.o lib/core.o lib/slide.o $(ANCHOR)
 
 ifeq ($(TARGET),test)
 obj-m := test_probe.o

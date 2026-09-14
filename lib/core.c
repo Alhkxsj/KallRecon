@@ -45,6 +45,13 @@ unsigned long (*kallrecon_klp)(const char *name);
 unsigned long (*kallrecon_module_klp)(const char *name); /* experimental, may be unstable */
 #endif
 
+#ifdef CONFIG_X86_64
+/* 5.10~6.12 x86 GKI enables KALLSYMS_ABSOLUTE_PERCPU: percpu symbols
+ * are absolute positive offsets, normal symbols are rb-1-addr negative.
+ * 6.18+ removed the option, offsets are unsigned like arm64. */
+static int kl_abs_percpu;
+#endif
+
 /* strip LTO suffix like kernel cleanup_symbol_name()
  * 5.10/5.15 (no seqs): '$', 6.1+ (seqs): ".llvm."
  */
@@ -156,8 +163,15 @@ static int verify_offsets_rb(unsigned long cand, int len,
 						sprint_symbol(name,
 							kernel_base + o);
 						if (name[0] == '0' &&
-						    name[1] == 'x')
-							vok = 0;
+						    name[1] == 'x') {
+#ifdef CONFIG_X86_64
+							sprint_symbol(name,
+								rb - 1 - (s32)o);
+#endif
+							if (name[0] == '0' &&
+							    name[1] == 'x')
+								vok = 0;
+						}
 					}
 				}
 			}
@@ -477,6 +491,22 @@ ks_dbg("[kallrecon] layout: offsets not found\n");
 		}
 	}
 
+#ifdef CONFIG_X86_64
+	/* tail entries are the highest-address normal symbols; a negative
+	 * s32 there means the ABSOLUTE_PERCPU layout is in effect */
+	if (kloffs_addr && klnum_val > 64) {
+		for (u32 i = klnum_val - 64; i < klnum_val; i++) {
+			u32 v;
+			if (safe_read(&v, (void *)(kloffs_addr + i * 4), 4))
+				continue;
+			if ((s32)v < 0) {
+				kl_abs_percpu = 1;
+				break;
+			}
+		}
+	}
+#endif
+
 ks_dbg("[kallrecon] kallsyms data:\n");
 ks_dbg("  klbase  @ 0x%lx = 0x%lx\n", klbase_addr, klbase_val);
 ks_dbg("  kloffs  @ 0x%lx\n", kloffs_addr);
@@ -560,6 +590,14 @@ unsigned long sym_addr(int idx)
 	u32 off;
 	if (safe_read(&off, (void *)(kloffs_addr + idx * 4), 4))
 		return 0;
+#ifdef CONFIG_X86_64
+	if (kl_abs_percpu) {
+		s32 so = (s32)off;
+		if (so >= 0)
+			return (unsigned long)(u32)so;
+		return klbase_val - 1 - so;
+	}
+#endif
 	return klbase_val + off;
 }
 
