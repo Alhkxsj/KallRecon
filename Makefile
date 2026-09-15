@@ -26,6 +26,10 @@ ifdef KALLRECON_FAST_BOOT
 ccflags-y += -DKALLRECON_FAST_BOOT
 endif
 
+ifdef KALLRECON_NO_MARKERS
+ccflags-y += -DKALLRECON_NO_MARKERS
+endif
+
 ccflags-y += -std=gnu11
 ccflags-y += -Wno-declaration-after-statement
 ccflags-y += -Wno-unused-variable

@@ -28,6 +28,7 @@
 #define KS_FALLBACK_OFF	0x1000		/* token_table fallback guess */
 #define KS_SCAN_BACK	0x400000	/* scan range below token_table */
 #define KS_SCAN_FWD	0x200000	/* scan range above token_index */
+#define KS_NUM_SEARCH	0x1000000	/* v3 num_syms search below names */
 #define KS_PCPU_EXT_MAX	100000		/* percpu extend entry cap */
 #define KS_PCPU_MAX	0x10000000	/* percpu absolute address cap */
 #define KS_2M_MASK	0x1FFFFFULL	/* kernel base alignment */
@@ -65,6 +66,7 @@ unsigned long (*kallrecon_module_klp)(const char *name); /* experimental, may be
  * 6.18+ removed the option and uses KS_MODE_RB like arm64 */
 #define KS_MODE_RB	0
 #define KS_MODE_ABSPCPU	1
+#define KS_MODE_SELFREL	2
 static int kl_addr_mode = KS_MODE_RB;
 
 /* strip LTO suffix like kernel cleanup_symbol_name()
@@ -141,6 +143,13 @@ static unsigned long find_token_table(unsigned long ti_addr,
  * on the offset stored in markers[1]; only then get_sym_offset() may
  * trust markers to skip ahead */
 static int kl_markers_ok;
+
+/* -DKALLRECON_NO_MARKERS forces the original full names walk */
+#ifdef KALLRECON_NO_MARKERS
+#define ks_markers_usable()	0
+#else
+#define ks_markers_usable()	(kl_markers_ok == 1)
+#endif
 
 static void verify_markers(void)
 {
@@ -315,6 +324,47 @@ static int verify_offsets_rb(unsigned long cand, int len,
 	return 0;
 }
 
+/* v3 (7.0+): offsets are self-relative, addr = entry + (s32)off.
+ * entry[0] is the lowest-address symbol (_text on arm64, the percpu
+ * block on x86) so its resolved address never exceeds kernel_base;
+ * the middle of the table holds .text symbols that sprint resolves */
+static int verify_offsets_selfrel(unsigned long cand, int len)
+{
+	u32 o0;
+
+	if (len < 3)
+		return 0;
+	if (safe_read(&o0, (void *)cand, 4))
+		return 0;
+	if (cand + (s32)o0 > kernel_base) {
+		ks_dbg("[kallrecon] selfrel reject: head 0x%lx\n",
+			cand + (s32)o0);
+		return 0;
+	}
+
+	for (int i = 0; i < 3; i++) {
+		int idx = len / 2 + i;
+		unsigned long at, a;
+		u32 o;
+		char name[KSYM_SYMBOL_LEN];
+
+		if (idx >= len)
+			idx = len - 1;
+		at = cand + (unsigned long)idx * 4;
+		if (safe_read(&o, (void *)at, 4))
+			return 0;
+		a = at + (s32)o;
+		sprint_symbol(name, a);
+		ks_dbg("[kallrecon] mid[%d] @0x%lx = 0x%x -> 0x%lx '%s'\n",
+			i, at, o, a, name);
+		if (name[0] == '0' && name[1] == 'x')
+			return 0;
+	}
+
+	kl_addr_mode = KS_MODE_SELFREL;
+	return 1;
+}
+
 /* verify a candidate offsets run and publish the globals on success */
 static int commit_offsets(unsigned long cand, int len,
 			  unsigned long *best_cand, int *best_len)
@@ -439,7 +489,131 @@ static int rev_commit(unsigned long cand, int len, int head,
 
 	return commit_offsets(full, len + pc, best_cand, best_len);
 }
+#endif
 
+/* walk the head of a compressed names stream: length byte(s) plus
+ * token indexes must stay within sane bounds for consecutive
+ * symbols */
+static int names_stream_ok(unsigned long names)
+{
+	unsigned long p = names;
+
+	for (int count = 0; count < 16; count++) {
+		unsigned char lb;
+		unsigned int len;
+
+		if (safe_read(&lb, (void *)p, 1))
+			return 0;
+		if (lb & 0x80) {
+			unsigned char lb2;
+			if (safe_read(&lb2, (void *)(p + 1), 1))
+				return 0;
+			len = (lb & 0x7F) | (lb2 << 7);
+			p += 2;
+		} else {
+			len = lb;
+			p += 1;
+		}
+		if (!len || len > 128)
+			return 0;
+		p += len;
+	}
+	return 1;
+}
+
+/* v3 (7.0+): kallsyms_num_syms sits right before kallsyms_names, far
+ * below the offsets table. locate it by scanning backwards for the
+ * count and validating the names stream that follows. */
+static unsigned long find_v3_num(unsigned long below, unsigned int n)
+{
+	unsigned long start = below > KS_NUM_SEARCH ?
+		below - KS_NUM_SEARCH : kernel_base;
+	struct slide_win w;
+
+	if (slide_init(&w, start, KS_WIN_SIZE, KS_WIN_MARGIN))
+		return 0;
+
+	for (;;) {
+		unsigned long addr = slide_addr(&w);
+		u32 v;
+
+		if (addr + 4 > below)
+			break;
+		v = *(u32 *)slide_ptr(&w, slide_buf);
+		if ((v == n || v == n - 1 || v == n + 1) &&
+		    names_stream_ok(addr + 4))
+			return addr;
+		if (slide_advance(&w, 4))
+			break;
+	}
+	return 0;
+}
+
+/* v3 (7.0+): offsets are self-relative s32; the table starts at the
+ * lowest symbol (negative offset) and ascends within a -4 tolerance
+ * (symbol addresses ascend, entries ascend by 4) */
+static int scan_selfrel(unsigned long start, unsigned long end,
+			unsigned long *best_cand, int *best_len)
+{
+	int found = 0;
+	struct slide_win w;
+
+	if (slide_init(&w, start, KS_WIN_SIZE, KS_WIN_MARGIN))
+		return 0;
+
+	for (;;) {
+		u32 v;
+		unsigned long addr = slide_addr(&w);
+		unsigned long cand;
+		int len = 0, prev;
+
+		if (addr >= end)
+			break;
+
+		v = *(u32 *)slide_ptr(&w, slide_buf);
+		if ((s32)v >= 0) {
+			if (slide_advance(&w, 4))
+				break;
+			continue;
+		}
+
+		cand = addr;
+		prev = (s32)v;
+
+		for (;;) {
+			unsigned long ext_addr = slide_addr(&w);
+
+			if (ext_addr >= end || len >= KS_RUN_MAX)
+				break;
+			v = *(u32 *)slide_ptr(&w, slide_buf);
+			if ((s32)v < prev - 4)
+				break;
+			prev = (s32)v;
+			len++;
+			if (slide_advance(&w, 4))
+				break;
+		}
+
+		if (len >= KS_RUN_MIN && len > *best_len) {
+			ks_dbg("[kallrecon] selfrel@0x%lx len=%d\n",
+				cand, len);
+			if (verify_offsets_selfrel(cand, len)) {
+				*best_cand = cand;
+				*best_len = len;
+				kloffs_addr = cand;
+				klnum_val = len;
+				found = 1;
+			}
+		}
+
+		if (slide_init(&w, cand + 4, KS_WIN_SIZE, KS_WIN_MARGIN))
+			break;
+	}
+
+	return found;
+}
+
+#ifdef CONFIG_X86_64
 static int scan_zerou32_rev(unsigned long start, unsigned long end,
 			    unsigned long *best_cand, int *best_len)
 {
@@ -505,6 +679,9 @@ static int discover_kallsyms(unsigned long ti_addr)
 		scan_start, scan_end, kltable_addr);
 
 	if (scan_zerou32(scan_start, scan_end, &best_cand, &best_len))
+		goto found;
+
+	if (scan_selfrel(scan_start, scan_end, &best_cand, &best_len))
 		goto found;
 
 #ifdef CONFIG_X86_64
@@ -651,7 +828,31 @@ ks_dbg("[kallrecon] layout: offsets not found\n");
 		return;
 	}
 
-	if (is_v1_layout) {
+	if (kl_addr_mode == KS_MODE_SELFREL) {
+		/* v3: no rb; num_syms and names sit below the markers */
+		unsigned long below = kltable_addr ? kltable_addr : kloffs_addr;
+		unsigned long num = find_v3_num(below, klnum_val);
+
+		if (num) {
+			u32 ns;
+			if (!safe_read(&ns, (void *)num, 4)) {
+				klnum_addr = num;
+				klnum_val = ns;
+				klnames_addr = num + 4;
+			}
+		}
+
+		if (kltable_addr && klnum_val) {
+			unsigned int markers_cnt = (klnum_val + 255) / 256;
+			klmarks_addr = (kltable_addr & ~3ULL) - markers_cnt * 4;
+		}
+
+		if (kloffs_addr && klnum_val)
+			klseqs_addr = detect_seqs(
+				(kloffs_addr +
+				 (unsigned long)klnum_val * 4 + 3) & ~3ULL,
+				klnum_val);
+	} else if (is_v1_layout) {
 		klnum_addr = (klbase_addr + 8 + 7) & ~7ULL;
 		{
 			u32 ns;
@@ -849,6 +1050,8 @@ unsigned long sym_addr(int idx)
 		return klbase_val - 1 - so;
 	}
 #endif
+	if (kl_addr_mode == KS_MODE_SELFREL)
+		return kloffs_addr + idx * 4 + (s32)off;
 	return klbase_val + off;
 }
 
@@ -925,7 +1128,7 @@ unsigned int get_sym_offset(unsigned int seq)
 
 	/* markers hold the stream offset of every 256th symbol; jump to
 	 * the nearest one instead of walking the whole stream */
-	if (kl_markers_ok == 1 && seq >= 256) {
+	if (ks_markers_usable() && seq >= 256) {
 		unsigned int m = seq / 256;
 		u32 mo;
 

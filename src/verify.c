@@ -19,6 +19,26 @@ static reg_kp_t reg_kp;
 static unreg_kp_t unreg_kp;
 static int kprobe_ok;
 
+__nocfi
+static int call_reg_kp(reg_kp_t fn, struct kprobe *kp)
+{
+	return fn(kp);
+}
+
+__nocfi
+static void call_unreg_kp(unreg_kp_t fn, struct kprobe *kp)
+{
+	fn(kp);
+}
+
+typedef int (*sno_t)(char *, unsigned long);
+
+__nocfi
+static int call_sno(sno_t fn, char *buf, unsigned long addr)
+{
+	return fn(buf, addr);
+}
+
 static int probe_kprobe(void)
 {
 	reg_kp = (reg_kp_t)kallsyms_name_to_addr("register_kprobe");
@@ -34,11 +54,11 @@ static int probe_kprobe(void)
 		.addr = (kprobe_opcode_t *)addr,
 		.flags = KPROBE_FLAG_DISABLED,
 	};
-	if (reg_kp(&kp) < 0) {
+	if (call_reg_kp(reg_kp, &kp) < 0) {
 		kprobe_ok = -1;
 		return 0;
 	}
-	unreg_kp(&kp);
+	call_unreg_kp(unreg_kp, &kp);
 	kprobe_ok = 1;
 	return 1;
 }
@@ -58,10 +78,10 @@ static unsigned long resolve_addr(const char *name)
 		.addr = (kprobe_opcode_t *)addr,
 		.flags = KPROBE_FLAG_DISABLED,
 	};
-	if (reg_kp(&kp) < 0)
+	if (call_reg_kp(reg_kp, &kp) < 0)
 		return 0;
 	unsigned long ret = (unsigned long)kp.addr;
-	unreg_kp(&kp);
+	call_unreg_kp(unreg_kp, &kp);
 	return ret;
 }
 
@@ -84,10 +104,9 @@ void verify_kallsyms(void)
 
 	pr_info("[kallrecon] verify: bootstrapping...\n");
 
-	typedef int (*sno_t)(char *, unsigned long);
 	sno_t sno = (sno_t)kallsyms_name_to_addr("sprint_symbol_no_offset");
 	if (sno)
-		sno(truth, test_addr);
+		call_sno(sno, truth, test_addr);
 	else
 		strcpy(truth, "(no sprint_symbol_no_offset)");
 
