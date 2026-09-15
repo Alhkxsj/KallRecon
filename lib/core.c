@@ -7,6 +7,7 @@
 
 #include <linux/module.h>
 #include <linux/printk.h>
+#include <linux/mutex.h>
 #include <linux/uaccess.h>
 #include <linux/kallsyms.h>
 #include <linux/version.h>
@@ -18,6 +19,19 @@
 #else
 #define ks_dbg(fmt, ...) do {} while (0)
 #endif
+
+#define KS_WIN_SIZE	(64 * 1024)	/* slide window chunk */
+#define KS_WIN_MARGIN	512		/* slide window overlap */
+#define KS_RUN_MIN	5000		/* min offsets run length */
+#define KS_RUN_MAX	500000		/* run scan cap */
+#define KS_RB_SEARCH	4096		/* rb delta search range */
+#define KS_FALLBACK_OFF	0x1000		/* token_table fallback guess */
+#define KS_SCAN_BACK	0x400000	/* scan range below token_table */
+#define KS_SCAN_FWD	0x200000	/* scan range above token_index */
+#define KS_PCPU_EXT_MAX	100000		/* percpu extend entry cap */
+#define KS_PCPU_MAX	0x10000000	/* percpu absolute address cap */
+#define KS_2M_MASK	0x1FFFFFULL	/* kernel base alignment */
+#define KS_PAGE_MASK	0xFFFULL	/* page alignment */
 
 int safe_read(void *dst, const void *src, size_t sz)
 {
@@ -45,12 +59,13 @@ unsigned long (*kallrecon_klp)(const char *name);
 unsigned long (*kallrecon_module_klp)(const char *name); /* experimental, may be unstable */
 #endif
 
-#ifdef CONFIG_X86_64
-/* 5.10~6.12 x86 GKI enables KALLSYMS_ABSOLUTE_PERCPU: percpu symbols
- * are absolute positive offsets, normal symbols are rb-1-addr negative.
- * 6.18+ removed the option, offsets are unsigned like arm64. */
-static int kl_abs_percpu;
-#endif
+/* address formula proven by verify_offsets_rb, latched so sym_addr()
+ * always uses the formula that resolved real symbols during discovery.
+ * x86 5.10~6.12 KALLSYMS_ABSOLUTE_PERCPU is covered by KS_MODE_ABSPCPU,
+ * 6.18+ removed the option and uses KS_MODE_RB like arm64 */
+#define KS_MODE_RB	0
+#define KS_MODE_ABSPCPU	1
+static int kl_addr_mode = KS_MODE_RB;
 
 /* strip LTO suffix like kernel cleanup_symbol_name()
  * 5.10/5.15 (no seqs): '$', 6.1+ (seqs): ".llvm."
@@ -73,15 +88,17 @@ static int (*kallrecon_user_cleanup)(char *s);
 
 static int ks_cleanup_name_chain(char *s)
 {
+	int (*cb)(char *s) = READ_ONCE(kallrecon_user_cleanup);
 	int r = ks_cleanup_name(s);
-	if (kallrecon_user_cleanup)
-		r |= kallrecon_user_cleanup(s) ? 1 : 0;
+
+	if (cb)
+		r |= cb(s) ? 1 : 0;
 	return r;
 }
 
 void kallrecon_set_cleanup(int (*cb)(char *s))
 {
-	kallrecon_user_cleanup = cb;
+	WRITE_ONCE(kallrecon_user_cleanup, cb);
 }
 
 static int check_ti_strong(unsigned short *ti)
@@ -93,6 +110,115 @@ static int check_ti_strong(unsigned short *ti)
 			return 0;
 	return ti['b'] - ti['a'] == 2 && ti['z'] - ti['a'] == 50;
 }
+
+/* locate token_table from token_index: walk back over trailing zeros
+ * and the last token string, then step back ti255 (token_index[255]
+ * holds the last token's offset inside token_table) */
+static unsigned long find_token_table(unsigned long ti_addr,
+				      unsigned short ti255)
+{
+	unsigned long pos = ti_addr - 1;
+	unsigned char c;
+
+	while (pos > kernel_base) {
+		if (safe_read(&c, (void *)pos, 1) || c != 0)
+			break;
+		pos--;
+	}
+	while (pos > kernel_base) {
+		if (safe_read(&c, (void *)pos, 1))
+			break;
+		if (c == 0)
+			break;
+		pos--;
+	}
+	if (pos + 1 > ti255)
+		return pos + 1 - ti255;
+	return 0;
+}
+
+/* markers sanity: walking 256 symbols from the stream start must land
+ * on the offset stored in markers[1]; only then get_sym_offset() may
+ * trust markers to skip ahead */
+static int kl_markers_ok;
+
+static void verify_markers(void)
+{
+	u32 m0, m1;
+	const u8 *p;
+	int i;
+
+	if (!klmarks_addr || !klnames_addr || klnum_val <= 512)
+		return;
+	if (safe_read(&m0, (void *)klmarks_addr, 4) ||
+	    safe_read(&m1, (void *)(klmarks_addr + 4), 4) || m0 != 0) {
+		kl_markers_ok = -1;
+		return;
+	}
+
+	p = (const u8 *)klnames_addr;
+	for (i = 0; i < 256; i++) {
+		unsigned char lb;
+		int len;
+
+		if (safe_read(&lb, (void *)p, 1))
+			break;
+		len = lb;
+		if (len & 0x80) {
+			if (safe_read(&lb, (void *)(p + 1), 1))
+				break;
+			len = (len & 0x7F) | (lb << 7);
+			p += 2 + len;
+		} else {
+			p += 1 + len;
+		}
+	}
+	kl_markers_ok = (i == 256 &&
+			 (unsigned int)(p - (const u8 *)klnames_addr) == m1)
+		? 1 : -1;
+	ks_dbg("[kallrecon] markers verify: %s\n",
+		kl_markers_ok == 1 ? "OK" : "MISMATCH");
+}
+/* empirically pick the address formula: try candidates in priority
+ * order, the first one resolving to a real symbol wins. entries sampled
+ * by the caller must sit inside [_stext, _end): head.text (arm64) and
+ * the percpu block (x86) resolve to hex under every formula */
+static int ks_addr_try(unsigned long rb, u32 off, int *mode)
+{
+	char name[KSYM_SYMBOL_LEN];
+
+#ifdef CONFIG_X86_64
+	{
+		s32 so = (s32)off;
+		unsigned long a = so >= 0 ? (unsigned long)(u32)so
+					  : rb - 1 - so;
+
+		sprint_symbol(name, a);
+		ks_dbg("[kallrecon] try abs 0x%x -> 0x%lx '%s'\n", off, a, name);
+		if (!(name[0] == '0' && name[1] == 'x')) {
+			*mode = KS_MODE_ABSPCPU;
+			return 1;
+		}
+	}
+#endif
+	sprint_symbol(name, rb + off);
+	ks_dbg("[kallrecon] try rb  0x%x -> 0x%lx '%s'\n", off, rb + off, name);
+	if (!(name[0] == '0' && name[1] == 'x')) {
+		*mode = KS_MODE_RB;
+		return 1;
+	}
+	/* rb+off may land in the .head.text gap; kernel_base fixes the
+	 * verification while the rb+off value itself stays correct */
+	sprint_symbol(name, kernel_base + off);
+	ks_dbg("[kallrecon] try kb  0x%x -> 0x%lx '%s'\n", off, kernel_base + off,
+		name);
+	if (!(name[0] == '0' && name[1] == 'x')) {
+		*mode = KS_MODE_RB;
+		return 1;
+	}
+	return 0;
+}
+
 static int verify_offsets_rb(unsigned long cand, int len,
 			      unsigned long *rb_out, unsigned long *rb_addr_out)
 {
@@ -109,7 +235,7 @@ static int verify_offsets_rb(unsigned long cand, int len,
 	int real_len = len - skip;
 
 	unsigned long base_rb = (cand + len * 4 + 7) & ~7ULL;
-	for (int delta = 0; delta < 4096; delta += 8) {
+	for (int delta = 0; delta < KS_RB_SEARCH; delta += 8) {
 		for (int sgn = 0; sgn < 2; sgn++) {
 			unsigned long rb_addr;
 			unsigned long rb;
@@ -149,34 +275,34 @@ static int verify_offsets_rb(unsigned long cand, int len,
 			}
 
 			int vok = 1;
-			for (int i = 0; i < 3 && vok; i++) {
-				u32 o;
-				if (safe_read(&o, (void *)(real_cand + i * 4), 4)) {
-					vok = 0;
-					break;
-				}
-				char name[KSYM_SYMBOL_LEN];
-				sprint_symbol(name, rb + o);
-				if (name[0] == '0' && name[1] == 'x') {
-					sprint_symbol(name, (u64)o);
-					if (name[0] == '0' && name[1] == 'x') {
-						sprint_symbol(name,
-							kernel_base + o);
-						if (name[0] == '0' &&
-						    name[1] == 'x') {
-#ifdef CONFIG_X86_64
-							sprint_symbol(name,
-								rb - 1 - (s32)o);
-#endif
-							if (name[0] == '0' &&
-							    name[1] == 'x')
-								vok = 0;
-						}
+			int mode = KS_MODE_RB;
+
+			if (real_len < 3) {
+				vok = 0;
+			} else {
+				/* sample the head: the .head.text gap (arm64)
+				 * is covered by ks_addr_try's kernel_base
+				 * fallback, same as the proven three-step
+				 * verification */
+				for (int i = 0; i < 3 && vok; i++) {
+					u32 o;
+					unsigned long at = real_cand +
+						(unsigned long)i * 4;
+
+					if (safe_read(&o, (void *)at, 4)) {
+						vok = 0;
+						break;
 					}
+					ks_dbg("[kallrecon] head[%d] @0x%lx = 0x%x\n",
+						i, at, o);
+					if (!ks_addr_try(rb, o, &mode))
+						vok = 0;
 				}
 			}
 			if (!vok)
 				continue;
+
+			kl_addr_mode = mode;	/* latch the proven formula */
 
 			if (rb_out)
 				*rb_out = rb;
@@ -189,13 +315,48 @@ static int verify_offsets_rb(unsigned long cand, int len,
 	return 0;
 }
 
+/* verify a candidate offsets run and publish the globals on success */
+static int commit_offsets(unsigned long cand, int len,
+			  unsigned long *best_cand, int *best_len)
+{
+	unsigned long rb, rb_addr;
+
+	if (len < KS_RUN_MIN)
+		return 0;
+	if (verify_offsets_rb(cand, len, &rb, &rb_addr)) {
+		*best_cand = cand;
+		*best_len = len;
+		kloffs_addr = cand;
+		klnum_val = len;
+		klbase_addr = rb_addr;
+		klbase_val = rb;
+		ks_dbg("[kallrecon] hit pg=0x%lx sorted=%d\n",
+			(unsigned long)(cand & ~KS_PAGE_MASK), len);
+		return 1;
+	}
+	if (len > KS_RUN_MIN &&
+	    verify_offsets_rb(cand, len - 1, &rb, &rb_addr)) {
+		*best_cand = cand;
+		*best_len = len - 1;
+		kloffs_addr = cand;
+		klnum_val = len - 1;
+		klbase_addr = rb_addr;
+		klbase_val = rb;
+		ks_dbg("[kallrecon] hit pg=0x%lx sorted=%d (len-1)\n",
+			(unsigned long)(cand & ~KS_PAGE_MASK), len);
+		return 1;
+	}
+	ks_dbg("[kallrecon] cand REJECT\n");
+	return 0;
+}
+
 static int scan_zerou32(unsigned long start, unsigned long end,
 			 unsigned long *best_cand, int *best_len)
 {
 	int found = 0;
 	struct slide_win w;
 
-	if (slide_init(&w, start, 64 * 1024, 512))
+	if (slide_init(&w, start, KS_WIN_SIZE, KS_WIN_MARGIN))
 		return 0;
 
 	for (;;) {
@@ -216,7 +377,7 @@ static int scan_zerou32(unsigned long start, unsigned long end,
 
 		for (;;) {
 			unsigned long ext_addr = slide_addr(&w);
-			if (ext_addr >= end || len >= 500000)
+			if (ext_addr >= end || len >= KS_RUN_MAX)
 				break;
 			v = *(u32 *)slide_ptr(&w, slide_buf);
 			if ((int)v < prev)
@@ -227,44 +388,18 @@ static int scan_zerou32(unsigned long start, unsigned long end,
 				break;
 		}
 
-		if (len >= 5000 && len > *best_len) {
+		if (len >= KS_RUN_MIN && len > *best_len) {
 			ks_dbg("[kallrecon] cand@0x%lx len=%d prev=0x%x\n",
 				cand, len, prev);
 
-			if (prev != 0 && (prev & 0x1FFFFF) == 0)
+			if (prev != 0 && (prev & KS_2M_MASK) == 0)
 				len--;
 
-			unsigned long rb, rb_addr;
-			if (verify_offsets_rb(cand, len, &rb, &rb_addr)) {
-				*best_cand = cand;
-				*best_len = len;
-				kloffs_addr = cand;
-				klnum_val = len;
-				klbase_addr = rb_addr;
-				klbase_val = rb;
+			if (commit_offsets(cand, len, best_cand, best_len))
 				found = 1;
-				ks_dbg("[kallrecon] hit pg=0x%lx sorted=%d\n",
-					(unsigned long)(cand & ~0xFFFULL), len);
-			} else if (len > 5000 &&
-				verify_offsets_rb(cand, len - 1,
-						  &rb, &rb_addr)) {
-				len--;
-				*best_cand = cand;
-				*best_len = len;
-				kloffs_addr = cand;
-				klnum_val = len;
-				klbase_addr = rb_addr;
-				klbase_val = rb;
-				found = 1;
-				ks_dbg("[kallrecon] hit pg=0x%lx sorted=%d (len-1)\n",
-					(unsigned long)(cand & ~0xFFFULL),
-					len);
-			} else {
-				ks_dbg("[kallrecon] cand REJECT\n");
-			}
 		}
 
-		if (slide_init(&w, cand + 4, 64 * 1024, 512))
+		if (slide_init(&w, cand + 4, KS_WIN_SIZE, KS_WIN_MARGIN))
 			break;
 	}
 
@@ -281,57 +416,28 @@ static int rev_commit(unsigned long cand, int len, int head,
 		      unsigned long *best_cand, int *best_len)
 {
 	unsigned long full = cand;
-	int pc = 0, pv = 0x7fffffff;
+	int pc = 0, pv = KS_PCPU_MAX;
 
 	/* the percpu block sits at the low end: absolute small positive
 	 * addresses, non-increasing when walked backwards */
-	while (full >= 4 && pc < 100000) {
+	while (full >= 4 && pc < KS_PCPU_EXT_MAX) {
 		u32 v;
 		int vi;
 
 		if (safe_read(&v, (void *)(full - 4), 4))
 			break;
 		vi = (int)v;
-		if (vi < 0 || vi > 0x10000000 || vi > pv)
+		if (vi < 0 || vi > KS_PCPU_MAX || vi > pv)
 			break;
 		pv = vi;
 		full -= 4;
 		pc++;
 	}
 
-	if (head != 0 && (head & 0x1FFFFF) == 0)
+	if (head != 0 && (head & KS_2M_MASK) == 0)
 		len--;
 
-	len += pc;
-	cand = full;
-	if (len < 5000)
-		return 0;
-
-	unsigned long rb, rb_addr;
-	if (verify_offsets_rb(cand, len, &rb, &rb_addr)) {
-		*best_cand = cand;
-		*best_len = len;
-		kloffs_addr = cand;
-		klnum_val = len;
-		klbase_addr = rb_addr;
-		klbase_val = rb;
-		ks_dbg("[kallrecon] hit rev pg=0x%lx sorted=%d\n",
-			(unsigned long)(cand & ~0xFFFULL), len);
-		return 1;
-	}
-	if (len > 5000 && verify_offsets_rb(cand, len - 1, &rb, &rb_addr)) {
-		*best_cand = cand;
-		*best_len = len - 1;
-		kloffs_addr = cand;
-		klnum_val = len - 1;
-		klbase_addr = rb_addr;
-		klbase_val = rb;
-		ks_dbg("[kallrecon] hit rev pg=0x%lx sorted=%d (len-1)\n",
-			(unsigned long)(cand & ~0xFFFULL), len);
-		return 1;
-	}
-	ks_dbg("[kallrecon] rev cand REJECT\n");
-	return 0;
+	return commit_offsets(full, len + pc, best_cand, best_len);
 }
 
 static int scan_zerou32_rev(unsigned long start, unsigned long end,
@@ -342,8 +448,8 @@ static int scan_zerou32_rev(unsigned long start, unsigned long end,
 	int len = 0, prev = 0, head = 0;
 
 	while (pos > start) {
-		unsigned long lo = pos - start > 64 * 1024 ?
-			pos - 64 * 1024 : start;
+		unsigned long lo = pos - start > KS_WIN_SIZE ?
+			pos - KS_WIN_SIZE : start;
 		unsigned int n = (unsigned int)((pos - lo) / 4);
 		int i;
 
@@ -357,7 +463,7 @@ static int scan_zerou32_rev(unsigned long start, unsigned long end,
 			unsigned long addr = lo + (unsigned long)i * 4;
 
 			if (len && (int)v < prev) {
-				if (len >= 5000 &&
+				if (len >= KS_RUN_MIN &&
 				    rev_commit(cand, len, head,
 					       best_cand, best_len))
 					return 1;
@@ -372,7 +478,7 @@ static int scan_zerou32_rev(unsigned long start, unsigned long end,
 		pos = lo;
 	}
 
-	if (len >= 5000 && rev_commit(cand, len, head, best_cand, best_len))
+	if (len >= KS_RUN_MIN && rev_commit(cand, len, head, best_cand, best_len))
 		return 1;
 	return 0;
 }
@@ -388,29 +494,12 @@ static int discover_kallsyms(unsigned long ti_addr)
 	if (safe_read(&ti255, (void *)(ti_addr + 255 * 2), 2))
 		return 0;
 
-	{
-		unsigned long pos = ti_addr - 1;
-		unsigned char c;
-		while (pos > kernel_base) {
-			if (safe_read(&c, (void *)pos, 1) || c != 0)
-				break;
-			pos--;
-		}
-		while (pos > kernel_base) {
-			if (safe_read(&c, (void *)pos, 1))
-				break;
-			if (c == 0)
-				break;
-			pos--;
-		}
-		if (pos + 1 > ti255)
-			kltable_addr = pos + 1 - ti255;
-		else
-			kltable_addr = ti_addr - 0x1000;
-	}
-	scan_start = kltable_addr > 0x400000 ?
-		(kltable_addr - 0x400000) & ~0xFFFULL : kernel_base;
-	scan_end = (ti_addr + 0x200000 + 0xFFF) & ~0xFFFULL;
+	kltable_addr = find_token_table(ti_addr, ti255);
+	if (!kltable_addr)
+		kltable_addr = ti_addr - KS_FALLBACK_OFF;
+	scan_start = kltable_addr > KS_SCAN_BACK ?
+		(kltable_addr - KS_SCAN_BACK) & ~KS_PAGE_MASK : kernel_base;
+	scan_end = (ti_addr + KS_SCAN_FWD + KS_PAGE_MASK) & ~KS_PAGE_MASK;
 
 	ks_dbg("[kallrecon] scan 0x%lx-0x%lx kltable=0x%lx\n",
 		scan_start, scan_end, kltable_addr);
@@ -438,7 +527,7 @@ static unsigned long find_token_index(unsigned long start)
 {
 	struct slide_win w;
 
-	if (slide_init(&w, start, 64 * 1024, 512))
+	if (slide_init(&w, start, KS_WIN_SIZE, KS_WIN_MARGIN))
 		return 0;
 
 	for (;;) {
@@ -475,16 +564,82 @@ static unsigned long detect_seqs(unsigned long cand, unsigned int n)
 	return cand;
 }
 
-void find_kallsyms_base(void)
+static DEFINE_MUTEX(ks_lock);
+static int ks_done;
+
+#ifdef KALLRECON_FAST_BOOT
+/* best-effort fast path: walk function boundaries with sprint_symbol
+ * from the anchor towards kallsyms_lookup_name. not expected to be
+ * stable; the full lookup stays authoritative and runs on a miss */
+static unsigned long fast_find_klp(void)
+{
+	unsigned long addr = sprint_addr;
+	char buf[KSYM_SYMBOL_LEN];
+
+	for (int i = 0; i < 200000; i++) {
+		char *plus;
+		unsigned long off = 0, size = 0;
+		const char *q;
+
+		sprint_symbol(buf, addr);
+		if (strstr(buf, "kallsyms_lookup_name"))
+			return addr;
+
+		plus = strrchr(buf, '+');
+		if (!plus)
+			return 0;
+
+		/* parse "+off/size" by hand, sscanf is not guaranteed exported */
+		q = plus + 1;
+		while (*q && *q != '/') {
+			char c = *q++;
+			unsigned long d;
+
+			if (c >= '0' && c <= '9')
+				d = c - '0';
+			else if (c >= 'a' && c <= 'f')
+				d = c - 'a' + 10;
+			else
+				return 0;
+			off = (off << 4) | d;
+		}
+		if (*q++ != '/')
+			return 0;
+		while (*q) {
+			char c = *q++;
+			unsigned long d;
+
+			if (c >= '0' && c <= '9')
+				d = c - '0';
+			else if (c >= 'a' && c <= 'f')
+				d = c - 'a' + 10;
+			else
+				break;
+			size = (size << 4) | d;
+		}
+
+		/* step to the previous function boundary */
+		if (off)
+			addr = (addr - off) - 1;
+		else if (addr > 4)
+			addr -= 4;
+		else
+			return 0;
+	}
+	return 0;
+}
+#endif
+
+static void find_kallsyms_base_once(void)
 {
 	sprint_addr = kr_get_sprint_addr();
-	kernel_base = sprint_addr & ~0x1FFFFFULL;
+	kernel_base = sprint_addr & ~KS_2M_MASK;
 	klbase_val = kernel_base;
 
 ks_dbg("[kallrecon] sprint=0x%lx kernel_base=0x%lx\n",
 		sprint_addr, kernel_base);
 
-	unsigned long ti_addr = find_token_index(sprint_addr & ~0xFFFULL);
+	unsigned long ti_addr = find_token_index(sprint_addr & ~KS_PAGE_MASK);
 	if (!ti_addr) {
 ks_dbg("[kallrecon] token_index not found\n");
 		return;
@@ -508,23 +663,13 @@ ks_dbg("[kallrecon] layout: offsets not found\n");
 
 		if (klindex_addr && klnum_val) {
 			unsigned short ti255;
-			if (!safe_read(&ti255, (void *)(klindex_addr + 255 * 2), 2)) {
-				unsigned long pos = klindex_addr - 1;
-				unsigned char c;
-				while (pos > 0) {
-					if (safe_read(&c, (void *)pos, 1) || c != 0)
-						break;
-					pos--;
-				}
-				while (pos > 0) {
-					if (safe_read(&c, (void *)pos, 1))
-						break;
-					if (c == 0)
-						break;
-					pos--;
-				}
-					if (pos + 1 > ti255)
-					kltable_addr = pos + 1 - ti255;
+			unsigned long tt;
+
+			if (!safe_read(&ti255,
+				       (void *)(klindex_addr + 255 * 2), 2)) {
+				tt = find_token_table(klindex_addr, ti255);
+				if (tt)
+					kltable_addr = tt;
 			}
 		}
 
@@ -542,23 +687,13 @@ ks_dbg("[kallrecon] layout: offsets not found\n");
 
 		if (klindex_addr && klnum_val) {
 			unsigned short ti255;
-			if (!safe_read(&ti255, (void *)(klindex_addr + 255 * 2), 2)) {
-				unsigned long pos = klindex_addr - 1;
-				unsigned char c;
-				while (pos > 0) {
-					if (safe_read(&c, (void *)pos, 1) || c != 0)
-						break;
-					pos--;
-				}
-				while (pos > 0) {
-					if (safe_read(&c, (void *)pos, 1))
-						break;
-					if (c == 0)
-						break;
-					pos--;
-				}
-					if (pos + 1 > ti255)
-					kltable_addr = pos + 1 - ti255;
+			unsigned long tt;
+
+			if (!safe_read(&ti255,
+				       (void *)(klindex_addr + 255 * 2), 2)) {
+				tt = find_token_table(klindex_addr, ti255);
+				if (tt)
+					kltable_addr = tt;
 			}
 		}
 
@@ -603,21 +738,7 @@ ks_dbg("[kallrecon] layout: offsets not found\n");
 		}
 	}
 
-#ifdef CONFIG_X86_64
-	/* tail entries are the highest-address normal symbols; a negative
-	 * s32 there means the ABSOLUTE_PERCPU layout is in effect */
-	if (kloffs_addr && klnum_val > 64) {
-		for (u32 i = klnum_val - 64; i < klnum_val; i++) {
-			u32 v;
-			if (safe_read(&v, (void *)(kloffs_addr + i * 4), 4))
-				continue;
-			if ((s32)v < 0) {
-				kl_abs_percpu = 1;
-				break;
-			}
-		}
-	}
-#endif
+	verify_markers();
 
 ks_dbg("[kallrecon] kallsyms data:\n");
 ks_dbg("  klbase  @ 0x%lx = 0x%lx\n", klbase_addr, klbase_val);
@@ -684,7 +805,15 @@ ks_dbg("  klnames @ 0x%lx\n", klnames_addr);
 #endif
 
 	if (klbase_addr && kloffs_addr) {
-		unsigned long addr = kallsyms_name_to_addr("kallsyms_lookup_name");
+		unsigned long addr = 0;
+
+#ifdef KALLRECON_FAST_BOOT
+		addr = fast_find_klp();
+		ks_dbg("[kallrecon] fast boot: %s\n",
+			addr ? "hit" : "miss");
+#endif
+		if (!addr)
+			addr = kallsyms_name_to_addr("kallsyms_lookup_name");
 		if (addr)
 			kallrecon_klp = (unsigned long (*)(const char *))addr;
 
@@ -697,13 +826,23 @@ ks_dbg("  klnames @ 0x%lx\n", klnames_addr);
 	}
 }
 
+void find_kallsyms_base(void)
+{
+	mutex_lock(&ks_lock);
+	if (!ks_done) {
+		find_kallsyms_base_once();
+		ks_done = 1;
+	}
+	mutex_unlock(&ks_lock);
+}
+
 unsigned long sym_addr(int idx)
 {
 	u32 off;
 	if (safe_read(&off, (void *)(kloffs_addr + idx * 4), 4))
 		return 0;
 #ifdef CONFIG_X86_64
-	if (kl_abs_percpu) {
+	if (kl_addr_mode == KS_MODE_ABSPCPU) {
 		s32 so = (s32)off;
 		if (so >= 0)
 			return (unsigned long)(u32)so;
@@ -781,8 +920,23 @@ unsigned int get_sym_seq(int idx)
 
 unsigned int get_sym_offset(unsigned int seq)
 {
-	const u8 *p = (const u8 *)klnames_addr;
+	const u8 *p;
 	unsigned char lb;
+
+	/* markers hold the stream offset of every 256th symbol; jump to
+	 * the nearest one instead of walking the whole stream */
+	if (kl_markers_ok == 1 && seq >= 256) {
+		unsigned int m = seq / 256;
+		u32 mo;
+
+		if (safe_read(&mo, (void *)(klmarks_addr + m * 4), 4))
+			return UINT_MAX;
+		seq -= m * 256;
+		p = (const u8 *)(klnames_addr + mo);
+	} else {
+		p = (const u8 *)klnames_addr;
+	}
+
 	for (unsigned int i = 0; i < seq; i++) {
 		if (safe_read(&lb, (void *)p, 1))
 			return UINT_MAX;
@@ -835,7 +989,9 @@ static int expand_sym_buf(unsigned short *ti, unsigned char *tt,
 	return 1;
 }
 
-static unsigned long name_to_addr_linear(const char *name)
+static DEFINE_MUTEX(ks_linear_lock);
+
+static unsigned long name_to_addr_linear_locked(const char *name)
 {
 	unsigned short *ti = ti_buf;
 	unsigned char *tt = tt_buf;
@@ -854,7 +1010,7 @@ static unsigned long name_to_addr_linear(const char *name)
 		return 0;
 	}
 
-	if (slide_init(&w, klnames_addr, 64 * 1024, 512)) {
+	if (slide_init(&w, klnames_addr, KS_WIN_SIZE, KS_WIN_MARGIN)) {
 		ks_dbg("[kallrecon] linear: slide init FAIL\n");
 		return 0;
 	}
@@ -913,6 +1069,17 @@ static unsigned long name_to_addr_linear(const char *name)
 		return kallrecon_module_klp(name);
 #endif
 	return 0;
+}
+
+/* linear scan shares slide_buf/ti_buf/tt_buf globals, serialize it */
+static unsigned long name_to_addr_linear(const char *name)
+{
+	unsigned long ret;
+
+	mutex_lock(&ks_linear_lock);
+	ret = name_to_addr_linear_locked(name);
+	mutex_unlock(&ks_linear_lock);
+	return ret;
 }
 
 unsigned long kallsyms_name_to_addr(const char *name)

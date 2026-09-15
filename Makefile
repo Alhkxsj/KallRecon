@@ -22,6 +22,10 @@ ifdef KALLRECON_MODULE_LOOKUP
 ccflags-y += -DKALLRECON_MODULE_LOOKUP
 endif
 
+ifdef KALLRECON_FAST_BOOT
+ccflags-y += -DKALLRECON_FAST_BOOT
+endif
+
 ccflags-y += -std=gnu11
 ccflags-y += -Wno-declaration-after-statement
 ccflags-y += -Wno-unused-variable
