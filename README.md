@@ -1,17 +1,22 @@
 # KallRecon
 
 discovers and reconstructs the kallsyms symbol table from kernel
-image memory on ARM64 GKI. locates kallsyms_lookup_name to provide
-symbol resolution from within an LKM. inspired by
-[ksymless](https://github.com/rota1001/ksymless) and depends only on
-sprint_symbol.
+image memory on ARM64 and x86_64 kernels. covers GKI 5.10 through
+6.18 and mainline 7.0+ (self relative layout). locates
+kallsyms_lookup_name to provide symbol resolution from within an LKM.
+inspired by [ksymless](https://github.com/rota1001/ksymless) and
+depends only on sprint_symbol.
 
 on kallsyms: [xcellerator](https://xcellerator.github.io/posts/linux_rootkits_11/)
 
 ## requirements
 
-- ARM64 device with GKI kernel
+- ARM64 or x86_64 kernel, GKI 5.10 to 6.18 or mainline 7.0+
 - sprint_symbol exported
+
+## docs
+
+API reference: [doc/API.md](doc/API.md)
 
 ## credits
 

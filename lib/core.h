@@ -27,7 +27,14 @@ extern unsigned long kltable_addr;
 extern unsigned long klnames_addr;
 extern unsigned long klnum_addr;
 
-extern int is_v1_layout;
+enum layout_v {
+	LAYOUT_V1 = 1,
+	LAYOUT_V2 = 2,
+	LAYOUT_V3 = 3,
+};
+
+extern enum layout_v kl_layout;
+extern int is_v1_layout;	/* mirror of kl_layout == LAYOUT_V1 */
 
 extern unsigned long (*kallrecon_klp)(const char *name);
 #ifdef KALLRECON_MODULE_LOOKUP

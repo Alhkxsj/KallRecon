@@ -4,8 +4,8 @@ else
 ANCHOR := lib/anchor.o
 endif
 
-kallrecon-objs := src/main.o lib/core.o lib/slide.o $(ANCHOR) src/verify.o
-test_probe-objs := test/test_main.o test/dbg.o lib/core.o lib/slide.o $(ANCHOR)
+kallrecon-objs := src/main.o lib/core.o lib/access.o lib/discover.o lib/symbol.o lib/slide.o $(ANCHOR) src/verify.o
+test_probe-objs := test/test_main.o test/dbg.o lib/core.o lib/access.o lib/discover.o lib/symbol.o lib/slide.o $(ANCHOR)
 
 ifeq ($(TARGET),test)
 obj-m := test_probe.o

@@ -8,9 +8,10 @@ kernel memory and populates the globals. after that use the lookup functions.
 **`void find_kallsyms_base(void)`**
 
 the one call that starts everything. scans kernel memory upwards from
-`sprint_symbol`, finds the token_index, token_table, offsets table,
-relative base, markers, names, num_syms, and optionally seqs. on success
-`klnum_val` is nonzero and `kallrecon_klp` is ready.
+`sprint_symbol`, finds the token_index, token_table, offsets table
+(self relative on v3), relative base, markers, names, num_syms, and
+optionally seqs. on success `klnum_val` is nonzero and `kallrecon_klp`
+is ready.
 
 if it fails `klnum_val` stays zero and `kallrecon_klp` is not set;
 `sprint_addr`/`kernel_base`/`klbase_val` are populated regardless
@@ -22,8 +23,11 @@ if it fails `klnum_val` stays zero and `kallrecon_klp` is not set;
 
 `klbase_val` — kernel text base, the value of `kallsyms_relative_base`
 
-`is_v1_layout` — 1 for pre-6.4 layout (offsets before token_index), 0 for
-6.4+ layout (offsets after token_index)
+`kl_layout` — LAYOUT_V1 / LAYOUT_V2 / LAYOUT_V3. v1 is the pre-6.4 layout
+(offsets before token_index), v2 the 6.4+ layout (offsets after
+token_index), v3 the 7.0+ self relative layout without a relative base.
+`is_v1_layout` stays as a mirror of `kl_layout == LAYOUT_V1` for existing
+consumers
 
 `sprint_addr` — runtime address of `sprint_symbol`, the discovery anchor
 
@@ -127,3 +131,9 @@ unsigned int chunksz, unsigned int margin)`**
 
 `KALLRECON_MODULE_LOOKUP=1` — enable the experimental
 `module_kallsyms_lookup_name` fallback
+
+`KALLRECON_FAST_BOOT=1` — sprint-walk fast path for the initial
+`kallsyms_lookup_name` bootstrap, falls back to the full lookup
+
+`KALLRECON_NO_MARKERS=1` — always walk the full names table, never use
+the markers shortcut

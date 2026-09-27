@@ -10,6 +10,9 @@
 
 #include <linux/types.h>
 
+#define KS_WIN_SIZE	(64 * 1024)	/* slide window chunk */
+#define KS_WIN_MARGIN	512		/* slide window overlap */
+
 extern unsigned int slide_buf[];
 
 struct slide_win {
