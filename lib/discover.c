@@ -262,92 +262,129 @@ static int commit_offsets(unsigned long cand, int len,
 	return 0;
 }
 
-/* shared forward scanner: v1/v2 look for the zero-anchored ascending
- * u32 run, v3 for negative self-relative values ascending within a -4
- * tolerance (symbol addresses ascend, entries ascend by 4). both keep
- * scanning after a hit and the longest verified run wins */
-static int scan_forward(unsigned long start, unsigned long end, int selfrel,
-			unsigned long *best_cand, int *best_len)
+struct scan_run {
+	int active;
+	int len;
+	int prev;
+	unsigned long cand;
+	unsigned long prev_addr;
+};
+
+/* close one run: same threshold and verification as before */
+static void scan_run_close(struct scan_run *r, int selfrel,
+			   unsigned long *best_cand, int *best_len, int *found)
+{
+	if (r->len >= KS_RUN_MIN && r->len > *best_len) {
+		if (selfrel) {
+			ks_dbg("[kallrecon] selfrel@0x%lx len=%d\n",
+				r->cand, r->len);
+			if (verify_offsets_selfrel(r->cand, r->len)) {
+				publish_offsets(r->cand, r->len, best_cand,
+						best_len);
+				*found = 1;
+			}
+		} else {
+			int len = r->len;
+
+			ks_dbg("[kallrecon] cand@0x%lx len=%d prev=0x%x\n",
+				r->cand, len, r->prev);
+
+			if (r->prev != 0 && (r->prev & KS_2M_MASK) == 0)
+				len--;
+
+			if (commit_offsets(r->cand, len, best_cand, best_len))
+				*found = 1;
+		}
+	}
+	r->active = 0;
+}
+
+/* single scan for both segment shapes
+ * v1/v2 tables are zero anchored ascending u32 runs, v3 tables are
+ * negative self relative values ascending within a -4 tolerance,
+ * a zero only starts the first shape and a negative only the second,
+ * so both runs stay independent, longest verified run wins */
+static int scan_both(unsigned long start, unsigned long end,
+		     unsigned long *best_cand, int *best_len)
 {
 	int found = 0;
+	struct scan_run r2 = {0}, r3 = {0};
 	struct slide_win w;
 
 	if (slide_init(&w, start, KS_WIN_SIZE, KS_WIN_MARGIN))
 		return 0;
 
 	for (;;) {
-		u32 v;
 		unsigned long addr = slide_addr(&w);
-		unsigned long cand;
-		int len = 0, prev;
+		u32 v;
 
 		if (addr >= end)
 			break;
 
+		/* a hole hop breaks both runs: the data does not continue */
+		if (r2.active && addr != r2.prev_addr + 4)
+			scan_run_close(&r2, 0, best_cand, best_len, &found);
+		if (r3.active && addr != r3.prev_addr + 4)
+			scan_run_close(&r3, 1, best_cand, best_len, &found);
+
 		v = *(u32 *)slide_ptr(&w, slide_buf);
-		if (selfrel ? (s32)v >= 0 : v != 0) {
-			if (slide_advance(&w, 4))
-				break;
-			continue;
-		}
 
-		cand = addr;
-		prev = selfrel ? (s32)v : -1;
-		{
-			unsigned long prev_addr = addr;
-
-			for (;;) {
-				unsigned long ext_addr = slide_addr(&w);
-
-				if (ext_addr >= end || len >= KS_RUN_MAX)
-					break;
-				/* a hole hop moves the window past unreadable
-				 * bytes, the run cannot continue across it */
-				if (len && ext_addr != prev_addr + 4)
-					break;
-				v = *(u32 *)slide_ptr(&w, slide_buf);
-				if (selfrel ? ((s32)v < prev - 4) :
-					      ((int)v < prev))
-					break;
-				prev = selfrel ? (s32)v : (int)v;
-				prev_addr = ext_addr;
-				len++;
-				if (slide_advance(&w, 4))
-					break;
-			}
-		}
-
-		if (len >= KS_RUN_MIN && len > *best_len) {
-			if (selfrel) {
-				ks_dbg("[kallrecon] selfrel@0x%lx len=%d\n",
-					cand, len);
-				if (verify_offsets_selfrel(cand, len)) {
-					publish_offsets(cand, len, best_cand,
-							best_len);
-					found = 1;
+		if (r2.active) {
+			if ((int)v < r2.prev) {
+				scan_run_close(&r2, 0, best_cand, best_len,
+					       &found);
+				if (v == 0) {
+					r2.active = 1;
+					r2.cand = addr;
+					r2.prev = 0;
+					r2.len = 1;
+					r2.prev_addr = addr;
 				}
 			} else {
-				ks_dbg("[kallrecon] cand@0x%lx len=%d prev=0x%x\n",
-					cand, len, prev);
-
-				if (prev != 0 && (prev & KS_2M_MASK) == 0)
-					len--;
-
-				if (commit_offsets(cand, len, best_cand,
-						   best_len))
-					found = 1;
+				r2.prev = (int)v;
+				r2.len++;
+				r2.prev_addr = addr;
 			}
+		} else if (v == 0) {
+			r2.active = 1;
+			r2.cand = addr;
+			r2.prev = 0;
+			r2.len = 1;
+			r2.prev_addr = addr;
 		}
 
-		/* the inner run already walked past cand+4: rewind inside
-		 * the window while it still covers that offset, only re-read
-		 * a fresh chunk otherwise (re-reading 64KB per candidate made
-		 * the scan O(candidates x 64KB)) */
-		if (cand + 4 >= w.addr && cand + 4 < w.addr + w.chunksz)
-			w.off = cand + 4 - w.addr;
-		else if (slide_init(&w, cand + 4, KS_WIN_SIZE, KS_WIN_MARGIN))
+		if (r3.active) {
+			if ((s32)v < r3.prev - 4) {
+				scan_run_close(&r3, 1, best_cand, best_len,
+					       &found);
+				if ((s32)v < 0) {
+					r3.active = 1;
+					r3.cand = addr;
+					r3.prev = (s32)v;
+					r3.len = 1;
+					r3.prev_addr = addr;
+				}
+			} else {
+				r3.prev = (s32)v;
+				r3.len++;
+				r3.prev_addr = addr;
+			}
+		} else if ((s32)v < 0) {
+			r3.active = 1;
+			r3.cand = addr;
+			r3.prev = (s32)v;
+			r3.len = 1;
+			r3.prev_addr = addr;
+		}
+
+		if (slide_advance(&w, 4))
 			break;
 	}
+
+	if (r2.active)
+		scan_run_close(&r2, 0, best_cand, best_len, &found);
+	if (r3.active)
+		scan_run_close(&r3, 1, best_cand, best_len, &found);
 
 	return found;
 }
@@ -491,8 +528,10 @@ static unsigned long find_v3_num(unsigned long below, unsigned int n)
 		if (addr + 4 > below)
 			break;
 		v = *(u32 *)slide_ptr(&w, slide_buf);
-		if ((v == n || v == n - 1 || v == n + 1) &&
-		    names_stream_ok(addr + 4))
+		/* the scanned run may swallow a few bytes of whatever
+		 * follows the offsets table that happen to ascend with it,
+		 * so the real count sits at or just below n */
+		if (v <= n && v >= n - 16 && names_stream_ok(addr + 4))
 			return addr;
 		if (slide_advance(&w, 4))
 			break;
@@ -520,10 +559,7 @@ static int discover_kallsyms(unsigned long ti_addr)
 	ks_dbg("[kallrecon] scan 0x%lx-0x%lx kltable=0x%lx\n",
 		scan_start, scan_end, kltable_addr);
 
-	if (scan_forward(scan_start, scan_end, 0, &best_cand, &best_len))
-		goto found;
-
-	if (scan_forward(scan_start, scan_end, 1, &best_cand, &best_len))
+	if (scan_both(scan_start, scan_end, &best_cand, &best_len))
 		goto found;
 
 #ifdef CONFIG_X86_64

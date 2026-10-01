@@ -2,8 +2,8 @@
 # inside anchor.S
 ANCHOR := lib/anchor.o
 
-kallrecon-objs := src/main.o lib/core.o lib/access.o lib/discover.o lib/symbol.o lib/slide.o $(ANCHOR) src/verify.o
-test_probe-objs := test/test_main.o test/dbg.o lib/core.o lib/access.o lib/discover.o lib/symbol.o lib/slide.o $(ANCHOR)
+kallrecon-objs := src/main.o lib/core.o lib/access.o lib/discover.o lib/symbol.o lib/slide.o lib/fastboot.o $(ANCHOR) src/verify.o
+test_probe-objs := test/test_main.o test/dbg.o lib/core.o lib/access.o lib/discover.o lib/symbol.o lib/slide.o lib/fastboot.o $(ANCHOR)
 
 ifeq ($(TARGET),test)
 obj-m := test_probe.o
@@ -22,6 +22,10 @@ endif
 
 ifdef KALLRECON_FAST_BOOT
 ccflags-y += -DKALLRECON_FAST_BOOT
+endif
+
+ifdef KALLRECON_FAST_BOOT_ALL
+ccflags-y += -DKALLRECON_FAST_BOOT_ALL=1
 endif
 
 ifdef KALLRECON_NO_MARKERS

@@ -138,7 +138,10 @@ unsigned int chunksz, unsigned int margin)`**
 `module_kallsyms_lookup_name` fallback
 
 `KALLRECON_FAST_BOOT=1` — sprint-walk fast path for the initial
-`kallsyms_lookup_name` bootstrap, falls back to the full lookup
+`kallsyms_lookup_name` bootstrap on linear (no seqs) kernels, falls
+back to the full lookup, off by default, only meant for speed
+measurement. `KALLRECON_FAST_BOOT_ALL=1` drops the seqs check and
+runs the walk on every kernel
 
 `KALLRECON_NO_MARKERS=1` — always walk the full names table, never use
 the markers shortcut
