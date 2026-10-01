@@ -69,9 +69,9 @@ the range `0 .. klnum_val - 1`; anything outside that range returns 0.
 
 address to name reverse lookup. binary searches the sorted addresses
 table, decodes the compressed name and writes it into `buf`. at most
-`max` bytes are written. returns the sorted index, or `-1` when the table
-is empty or the name cannot be decoded (`buf` is then set to an empty
-string).
+`max` bytes are written. returns the sorted index, or `-1` when `max` is
+not positive, the table is empty or the name cannot be decoded (with a
+positive `max`, `buf` is then set to an empty string).
 
 **`unsigned int get_sym_seq(int idx)`**, **`unsigned int get_sym_offset(unsigned int seq)`**
 
@@ -83,8 +83,9 @@ on the seqs layout (`klseqs_addr` nonzero). `get_sym_offset` returns
 
 decode one compressed symbol from token_table at offset `off` into `buf`.
 used for manual scanning over the names table. returns the number of bytes
-the compressed entry occupies, or `0` on a read/decode failure — in that
-case `buf` is set to an empty string.
+the compressed entry occupies, or `0` when `max` is not positive or on a
+read/decode failure — with a positive `max`, `buf` is then set to an empty
+string.
 
 ## Name cleanup
 

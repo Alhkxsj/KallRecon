@@ -1,3 +1,8 @@
+# this file is parsed twice: as the build driver (ARCH may be empty in that
+# parse, harmless because only kbuild consumes kallrecon-objs) and again
+# inside kbuild, where ARCH, SRCARCH and auto.conf are all set. the second
+# parse is the one that selects the anchor object.
+#
 # scripts/subarch.include turns `uname -m` x86_64 into SUBARCH=x86, and kbuild
 # then uses `ARCH ?= $(SUBARCH)`, so a native x86_64 build usually has ARCH=x86
 # (an explicit ARCH=x86_64 keeps the full name, but there it is SRCARCH that is
