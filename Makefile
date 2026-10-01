@@ -1,4 +1,11 @@
-ifeq ($(ARCH),x86_64)
+# scripts/subarch.include turns `uname -m` x86_64 into SUBARCH=x86, and kbuild
+# then uses `ARCH ?= $(SUBARCH)`, so a native x86_64 build usually has ARCH=x86
+# (an explicit ARCH=x86_64 keeps the full name, but there it is SRCARCH that is
+# canonicalized to x86). ARCH alone therefore misses most x86_64 builds: also
+# accept SRCARCH=x86 with CONFIG_64BIT from auto.conf.
+ifneq ($(filter x86_64,$(ARCH)),)
+ANCHOR := lib/anchor_x86.o
+else ifeq ($(SRCARCH)$(CONFIG_64BIT),x86y)
 ANCHOR := lib/anchor_x86.o
 else
 ANCHOR := lib/anchor.o

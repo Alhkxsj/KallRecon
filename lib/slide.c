@@ -7,6 +7,7 @@
 
 #include <linux/types.h>
 #include <linux/printk.h>
+#include <linux/build_bug.h>
 #include "core.h"
 #include "slide.h"
 
@@ -18,6 +19,13 @@
 
 #define SLIDE_BUF_WORDS (18 * 1024)
 unsigned int slide_buf[SLIDE_BUF_WORDS];
+
+/*
+ * The window reads chunksz + margin bytes, and check_ti_strong() reads
+ * 256 u16 past slide_ptr() at any offset inside the window.
+ */
+static_assert(sizeof(slide_buf) >= KS_WIN_SIZE + KS_WIN_MARGIN);
+static_assert(KS_WIN_MARGIN >= 256 * sizeof(unsigned short));
 
 int slide_init(struct slide_win *w, unsigned long pos,
 	       unsigned int chunksz, unsigned int margin)
@@ -40,6 +48,9 @@ int slide_init(struct slide_win *w, unsigned long pos,
 
 int slide_advance(struct slide_win *w, unsigned int n)
 {
+	unsigned long old_addr = w->addr;
+	unsigned int old_off = w->off;
+
 	w->off += n;
 
 	if (w->off >= w->chunksz) {
@@ -53,6 +64,8 @@ int slide_advance(struct slide_win *w, unsigned int n)
 
 		if (safe_read(slide_buf, (void *)w->addr, w->chunksz + w->margin)) {
 			slide_dbg("slide FAIL read @ 0x%lx\n", w->addr);
+			w->addr = old_addr;
+			w->off = old_off;
 			return -1;
 		}
 

@@ -104,6 +104,8 @@ unsigned long sym_addr(int idx)
 {
 	u32 off;
 
+	if (idx < 0 || idx >= (int)klnum_val)
+		return 0;
 	if (safe_read(&off, (void *)(kloffs_addr + idx * 4), 4))
 		return 0;
 #ifdef CONFIG_X86_64
@@ -189,6 +191,9 @@ int expand_sym(unsigned int off, char *buf, int max)
 	unsigned char enc[2 + 256];
 	unsigned int len, hdr;
 
+	if (max > 0)
+		buf[0] = '\0';	/* a failed read must not leave stale data */
+
 	if (safe_read(ti, (void *)klindex_addr, sizeof(ti)))
 		return 0;
 	if (safe_read(enc, (void *)(klnames_addr + off), 1))
@@ -205,8 +210,15 @@ int expand_sym(unsigned int off, char *buf, int max)
 		return 0;
 	if (safe_read(enc + hdr, (void *)(klnames_addr + off + hdr), len))
 		return 0;
-	if (!ks_expand_raw(enc, ti, NULL, buf, max))
+	if (!ks_expand_raw(enc, ti, NULL, buf, max)) {
+		/* ks_expand_raw() may have written a partial name without
+		 * the terminator, drop it so callers never see a stale or
+		 * unterminated buffer
+		 */
+		if (max > 0)
+			buf[0] = '\0';
 		return 0;
+	}
 	return (int)(hdr + len);
 }
 
@@ -382,7 +394,11 @@ unsigned long kallsyms_name_to_addr(const char *name)
 		unsigned int seq = get_sym_seq(mid);
 		unsigned int off = get_sym_offset(seq);
 
-		expand_sym(off, nbuf, sizeof(nbuf));
+		/* a decode failure ends the search here, but control still
+		 * reaches the module lookup fallback below
+		 */
+		if (!expand_sym(off, nbuf, sizeof(nbuf)))
+			break;
 		ks_cleanup_name_chain(nbuf);
 
 		int r = strcmp(name, nbuf);
@@ -400,7 +416,8 @@ unsigned long kallsyms_name_to_addr(const char *name)
 				unsigned int pseq = get_sym_seq(first - 1);
 				unsigned int poff = get_sym_offset(pseq);
 
-				expand_sym(poff, nbuf, sizeof(nbuf));
+				if (!expand_sym(poff, nbuf, sizeof(nbuf)))
+					break;
 				ks_cleanup_name_chain(nbuf);
 				if (strcmp(name, nbuf))
 					break;
@@ -420,6 +437,11 @@ int sym_name_at(unsigned long addr, char *buf, int max)
 {
 	int low = 0, high = (int)klnum_val;
 
+	if (max > 0)
+		buf[0] = '\0';
+	if (!klnum_val)
+		return -1;
+
 	while (high - low > 1) {
 		int mid = low + (high - low) / 2;
 
@@ -431,7 +453,8 @@ int sym_name_at(unsigned long addr, char *buf, int max)
 
 	unsigned int off = get_sym_offset(low);
 
-	expand_sym(off, buf, max);
+	if (!expand_sym(off, buf, max))
+		return -1;
 	ks_cleanup_name_chain(buf);
 	return low;
 }
