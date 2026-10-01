@@ -14,6 +14,11 @@
 #include "slide.h"
 #include "symbol.h"
 
+/* kernels without the CFI backport (vanilla 5.10) do not define __nocfi */
+#ifndef __nocfi
+#define __nocfi
+#endif
+
 #define KS_TT_SIZE	2048
 
 /* markers sanity: walking 256 symbols from the stream start must land
@@ -85,7 +90,7 @@ static int ks_cleanup_name(char *s)
 
 static int (*kallrecon_user_cleanup)(char *s);
 
-static int ks_cleanup_name_chain(char *s)
+static __nocfi int ks_cleanup_name_chain(char *s)
 {
 	int (*cb)(char *s) = READ_ONCE(kallrecon_user_cleanup);
 	int r = ks_cleanup_name(s);
