@@ -12,6 +12,11 @@
 #include "../lib/core.h"
 #include "verify.h"
 
+/* kernels without the CFI backport (vanilla 5.10) do not define __nocfi */
+#ifndef __nocfi
+#define __nocfi
+#endif
+
 typedef int (*reg_kp_t)(struct kprobe *);
 typedef void (*unreg_kp_t)(struct kprobe *);
 
@@ -111,13 +116,24 @@ void verify_kallsyms(void)
 		strcpy(truth, "(no sprint_symbol_no_offset)");
 
 	int idx = sym_name_at(test_addr, our, sizeof(our));
-	pr_info("[kallrecon] verify: addr->name '%s' %s\n",
+	pr_info("[kallrecon] verify: addr->name [%d] '%s' %s\n", idx,
 		our, strcmp(truth, our) == 0 ? "MATCH" : "MISMATCH");
 
 	unsigned long lookup = kallsyms_name_to_addr("kallsyms_lookup_name");
+	unsigned int op;
+	int match = lookup == test_addr;
+
+	/* x86 IBT: register_kprobe() lands4 bytes past the symbol
+	 * start when the function opens with ENDBR64
+	 * (arch_adjust_kprobe_addr), while sprint_symbol_no_offset
+	 * reports the plain name; accept lookup+4 with an ENDBR64
+	 * opcode (or its ftrace poison) at lookup as an exact hit */
+	if (!match && lookup && test_addr == lookup + 4 &&
+	    !safe_read(&op, (void *)lookup, 4) &&
+	    (op == 0xFA1E0FF3U || op == 0x001F0F66U))
+		match = 1;
 	pr_info("[kallrecon] verify: name->addr 0x%lx %s\n",
-		lookup,
-		lookup == test_addr ? "MATCH" : "MISMATCH");
+		lookup, match ? "MATCH" : "MISMATCH");
 
 }
 

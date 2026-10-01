@@ -137,20 +137,31 @@ static int verify_offsets_rb(unsigned long cand, int len,
 			if (real_len < 3) {
 				vok = 0;
 			} else {
-				/* sample the head: the .head.text gap (arm64)
-				 * is covered by ks_addr_try's kernel_base
-				 * fallback, same as the proven three-step
-				 * verification */
+				/* sample mid-table, like verify_offsets_selfrel:
+				 * mid entries are ordinary .text symbols on every
+				 * kernel. head is the x86 percpu absolute block:
+				 * its small positive off resolves to hex under
+				 * ABSPCPU while rb+off lands inside .text and
+				 * wrongly latches KS_MODE_RB (later negative
+				 * offsets then decode as zero-extended wraps).
+				 * tail is _end / its aliases: is_ksym_addr()
+				 * uses a strict addr < _end bound, so
+				 * sprint_symbol(_end) prints hex and the first
+				 * sample always fails. arm64 still latches
+				 * KS_MODE_RB exactly as head sampling did */
 				for (int i = 0; i < 3 && vok; i++) {
+					int idx = real_len / 2 + i;
 					u32 o;
-					unsigned long at = real_cand +
-						(unsigned long)i * 4;
+					unsigned long at;
 
+					if (idx >= real_len)
+						idx = real_len - 1;
+					at = real_cand + (unsigned long)idx * 4;
 					if (safe_read(&o, (void *)at, 4)) {
 						vok = 0;
 						break;
 					}
-					ks_dbg("[kallrecon] head[%d] @0x%lx = 0x%x\n",
+					ks_dbg("[kallrecon] mid[%d] @0x%lx = 0x%x\n",
 						i, at, o);
 					if (!ks_addr_try(rb, o, &mode))
 						vok = 0;
@@ -282,19 +293,28 @@ static int scan_forward(unsigned long start, unsigned long end, int selfrel,
 
 		cand = addr;
 		prev = selfrel ? (s32)v : -1;
+		{
+			unsigned long prev_addr = addr;
 
-		for (;;) {
-			unsigned long ext_addr = slide_addr(&w);
+			for (;;) {
+				unsigned long ext_addr = slide_addr(&w);
 
-			if (ext_addr >= end || len >= KS_RUN_MAX)
-				break;
-			v = *(u32 *)slide_ptr(&w, slide_buf);
-			if (selfrel ? ((s32)v < prev - 4) : ((int)v < prev))
-				break;
-			prev = selfrel ? (s32)v : (int)v;
-			len++;
-			if (slide_advance(&w, 4))
-				break;
+				if (ext_addr >= end || len >= KS_RUN_MAX)
+					break;
+				/* a hole hop moves the window past unreadable
+				 * bytes, the run cannot continue across it */
+				if (len && ext_addr != prev_addr + 4)
+					break;
+				v = *(u32 *)slide_ptr(&w, slide_buf);
+				if (selfrel ? ((s32)v < prev - 4) :
+					      ((int)v < prev))
+					break;
+				prev = selfrel ? (s32)v : (int)v;
+				prev_addr = ext_addr;
+				len++;
+				if (slide_advance(&w, 4))
+					break;
+			}
 		}
 
 		if (len >= KS_RUN_MIN && len > *best_len) {
@@ -319,7 +339,13 @@ static int scan_forward(unsigned long start, unsigned long end, int selfrel,
 			}
 		}
 
-		if (slide_init(&w, cand + 4, KS_WIN_SIZE, KS_WIN_MARGIN))
+		/* the inner run already walked past cand+4: rewind inside
+		 * the window while it still covers that offset, only re-read
+		 * a fresh chunk otherwise (re-reading 64KB per candidate made
+		 * the scan O(candidates x 64KB)) */
+		if (cand + 4 >= w.addr && cand + 4 < w.addr + w.chunksz)
+			w.off = cand + 4 - w.addr;
+		else if (slide_init(&w, cand + 4, KS_WIN_SIZE, KS_WIN_MARGIN))
 			break;
 	}
 
@@ -366,6 +392,7 @@ static int scan_zerou32_rev(unsigned long start, unsigned long end,
 	unsigned long pos = end;
 	unsigned long cand = 0;
 	int len = 0, prev = 0, head = 0;
+	unsigned long skipped = 0;
 
 	while (pos > start) {
 		unsigned long lo = pos - start > KS_WIN_SIZE ?
@@ -375,8 +402,19 @@ static int scan_zerou32_rev(unsigned long start, unsigned long end,
 
 		if (!n)
 			break;
-		if (safe_read(slide_buf, (void *)lo, n * 4))
-			break;
+		if (safe_read(slide_buf, (void *)lo, n * 4)) {
+			/* unreadable block: the run cannot continue across
+			 * it, commit what was collected and skip the block */
+			if (len >= KS_RUN_MIN &&
+			    rev_commit(cand, len, head, best_cand, best_len))
+				return 1;
+			len = 0;
+			skipped += pos - lo;
+			if (skipped > KS_HOLE_MAX || lo <= start)
+				break;
+			pos = lo;
+			continue;
+		}
 
 		for (i = (int)n - 1; i >= 0; i--) {
 			u32 v = slide_buf[i];
@@ -568,7 +606,10 @@ static void resolve_layout_v3(void)
 
 	if (kltable_addr && klnum_val) {
 		unsigned int markers_cnt = (klnum_val + 255) / 256;
-		klmarks_addr = (kltable_addr & ~3ULL) - markers_cnt * 4;
+
+		/* v3 labels are .balign 4 (not 8): the array start is size
+		 * bytes below token_table with no padding between them */
+		klmarks_addr = (kltable_addr - markers_cnt * 4) & ~3ULL;
 	}
 
 	if (kloffs_addr && klnum_val)
@@ -613,9 +654,13 @@ static void resolve_layout_v2(void)
 	if (kltable_addr && klnum_val) {
 		unsigned int markers_cnt = (klnum_val + 255) / 256;
 		unsigned long marks_size = markers_cnt * 4;
-		unsigned long marks_end = (kltable_addr + 7) & ~7ULL;
 
-		klmarks_addr = marks_end - marks_size;
+		/* the token_table label carries its own .balign 8, so up to
+		 * 7 pad bytes sit between the markers array and the label:
+		 * derive the array start from its size and floor it to the
+		 * label alignment (the markers label is .balign 8 as well,
+		 * so the floor lands exactly for either pad, 0 or 4) */
+		klmarks_addr = (kltable_addr - marks_size) & ~7ULL;
 	}
 
 	if (klmarks_addr && klnum_val) {
@@ -673,13 +718,14 @@ ks_dbg("  klnames @ 0x%lx\n", klnames_addr);
 		ks_dbg("  markers verify: %s\n", mok ? "OK" : "MISMATCH");
 	}
 	if (klnames_addr && klmarks_addr && klnum_val) {
-		unsigned int markers_cnt = (klnum_val + 255) / 256;
-		unsigned int end_off;
-		if (!safe_read(&end_off, (void *)(klmarks_addr +
-			(markers_cnt - 1) * 4), 4)) {
+		{
 			unsigned int count = 0;
+			/* the names stream ends at or before kallsyms_markers
+			 * (only .balign 8 label padding between them, read as
+			 * lb==0 below); the old end_off+1024 slack truncated
+			 * the final segment (15 names lost on a 165482 table) */
 			for (unsigned long p = klnames_addr;
-			     p < klnames_addr + end_off + 1024; ) {
+			     p < klmarks_addr; ) {
 				unsigned char lb;
 				unsigned int elen;
 				if (safe_read(&lb, (void *)p, 1))

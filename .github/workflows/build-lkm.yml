@@ -5,6 +5,7 @@ on:
       - 'lib/**'
       - 'src/**'
       - 'Makefile'
+      - 'deps.mk'
       - '.github/workflows/build-lkm.yml'
   workflow_dispatch:
 

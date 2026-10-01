@@ -14,6 +14,11 @@
 #include "slide.h"
 #include "symbol.h"
 
+/* kernels without the CFI backport (vanilla 5.10) do not define __nocfi */
+#ifndef __nocfi
+#define __nocfi
+#endif
+
 #define KS_TT_SIZE	2048
 
 /* markers sanity: walking 256 symbols from the stream start must land
@@ -85,7 +90,7 @@ static int ks_cleanup_name(char *s)
 
 static int (*kallrecon_user_cleanup)(char *s);
 
-static int ks_cleanup_name_chain(char *s)
+static __nocfi int ks_cleanup_name_chain(char *s)
 {
 	int (*cb)(char *s) = READ_ONCE(kallrecon_user_cleanup);
 	int r = ks_cleanup_name(s);
@@ -104,6 +109,8 @@ unsigned long sym_addr(int idx)
 {
 	u32 off;
 
+	if (idx < 0 || idx >= (int)klnum_val)
+		return 0;
 	if (safe_read(&off, (void *)(kloffs_addr + idx * 4), 4))
 		return 0;
 #ifdef CONFIG_X86_64
@@ -189,6 +196,10 @@ int expand_sym(unsigned int off, char *buf, int max)
 	unsigned char enc[2 + 256];
 	unsigned int len, hdr;
 
+	if (max <= 0)
+		return 0;
+	buf[0] = '\0';	/* a failed read must not leave stale data */
+
 	if (safe_read(ti, (void *)klindex_addr, sizeof(ti)))
 		return 0;
 	if (safe_read(enc, (void *)(klnames_addr + off), 1))
@@ -205,8 +216,14 @@ int expand_sym(unsigned int off, char *buf, int max)
 		return 0;
 	if (safe_read(enc + hdr, (void *)(klnames_addr + off + hdr), len))
 		return 0;
-	if (!ks_expand_raw(enc, ti, NULL, buf, max))
+	if (!ks_expand_raw(enc, ti, NULL, buf, max)) {
+		/* ks_expand_raw() may have written a partial name without
+		 * the terminator, drop it so callers never see a stale or
+		 * unterminated buffer
+		 */
+		buf[0] = '\0';
 		return 0;
+	}
 	return (int)(hdr + len);
 }
 
@@ -270,7 +287,7 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 	unsigned short *ti = ti_buf;
 	unsigned char *tt = tt_buf;
 	char nbuf[256];
-	int idx, hit = 0, decoded = 0;
+	int idx, hit = 0, decoded = 0, retried = 0;
 	struct slide_win w;
 
 	ks_dbg("[kallrecon] linear: search '%s' n=%u\n", name, klnum_val);
@@ -289,7 +306,7 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 		return 0;
 	}
 
-	for (idx = 0; idx < (int)klnum_val; idx++) {
+	for (idx = 0; idx < (int)klnum_val; ) {
 		const unsigned char *name_start = slide_ptr(&w, slide_buf);
 		int lb = *name_start;
 		int elen = lb;
@@ -300,14 +317,27 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 			hdr = 2;
 		}
 		if ((unsigned int)(hdr + elen) > 256U ||
-		    w.off + hdr + elen > w.chunksz + w.margin) {
-			ks_dbg("[kallrecon] linear: boundary fail idx=%d hdr=%d elen=%d\n",
-				idx, hdr, elen);
-			break;
+		    w.off + hdr + elen > w.valid) {
+			/* the entry extends past the readable part of
+			 * this window: pull in the next window and retry */
+			ks_dbg("[kallrecon] linear: window end idx=%d\n", idx);
+			if (retried ||
+			    slide_advance(&w, (w.valid - w.off) + 4))
+				break;
+			retried = 1;
+			continue;
 		}
+		retried = 0;
 
-		decoded++;
-		ks_expand_raw(name_start, ti, tt, nbuf, sizeof(nbuf));
+		if (!ks_expand_raw(name_start, ti, tt, nbuf, sizeof(nbuf))) {
+			/* a bad token index leaves nbuf partial without the
+			 * terminator, never hand it to strcmp()
+			 */
+			ks_dbg("[kallrecon] linear: decode fail idx=%d\n", idx);
+			nbuf[0] = '\0';
+		} else {
+			decoded++;
+		}
 		{
 			int sample = 0;
 
@@ -338,6 +368,7 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 			ks_dbg("[kallrecon] linear: slide fail idx=%d\n", idx);
 			break;
 		}
+		idx++;
 	}
 
 	ks_dbg("[kallrecon] linear: done idx=%d decoded=%d hit=%d\n",
@@ -382,7 +413,11 @@ unsigned long kallsyms_name_to_addr(const char *name)
 		unsigned int seq = get_sym_seq(mid);
 		unsigned int off = get_sym_offset(seq);
 
-		expand_sym(off, nbuf, sizeof(nbuf));
+		/* a decode failure ends the search here, but control still
+		 * reaches the module lookup fallback below
+		 */
+		if (!expand_sym(off, nbuf, sizeof(nbuf)))
+			break;
 		ks_cleanup_name_chain(nbuf);
 
 		int r = strcmp(name, nbuf);
@@ -400,7 +435,8 @@ unsigned long kallsyms_name_to_addr(const char *name)
 				unsigned int pseq = get_sym_seq(first - 1);
 				unsigned int poff = get_sym_offset(pseq);
 
-				expand_sym(poff, nbuf, sizeof(nbuf));
+				if (!expand_sym(poff, nbuf, sizeof(nbuf)))
+					break;
 				ks_cleanup_name_chain(nbuf);
 				if (strcmp(name, nbuf))
 					break;
@@ -420,6 +456,12 @@ int sym_name_at(unsigned long addr, char *buf, int max)
 {
 	int low = 0, high = (int)klnum_val;
 
+	if (max <= 0)
+		return -1;
+	buf[0] = '\0';
+	if (!klnum_val)
+		return -1;
+
 	while (high - low > 1) {
 		int mid = low + (high - low) / 2;
 
@@ -431,7 +473,8 @@ int sym_name_at(unsigned long addr, char *buf, int max)
 
 	unsigned int off = get_sym_offset(low);
 
-	expand_sym(off, buf, max);
+	if (!expand_sym(off, buf, max))
+		return -1;
 	ks_cleanup_name_chain(buf);
 	return low;
 }
