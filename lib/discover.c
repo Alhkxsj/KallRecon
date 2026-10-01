@@ -586,10 +586,9 @@ static void resolve_layout_v3(void)
 	if (kltable_addr && klnum_val) {
 		unsigned int markers_cnt = (klnum_val + 255) / 256;
 
-		/* same floor-to-label-alignment as v2: the array start is
-		 * size bytes below the (8-aligned) token_table label, minus
-		 * the label's alignment padding */
-		klmarks_addr = (kltable_addr - markers_cnt * 4) & ~7ULL;
+		/* v3 labels are .balign 4 (not 8): the array start is size
+		 * bytes below token_table with no padding between them */
+		klmarks_addr = (kltable_addr - markers_cnt * 4) & ~3ULL;
 	}
 
 	if (kloffs_addr && klnum_val)
