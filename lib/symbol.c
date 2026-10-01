@@ -287,7 +287,7 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 	unsigned short *ti = ti_buf;
 	unsigned char *tt = tt_buf;
 	char nbuf[256];
-	int idx, hit = 0, decoded = 0;
+	int idx, hit = 0, decoded = 0, retried = 0;
 	struct slide_win w;
 
 	ks_dbg("[kallrecon] linear: search '%s' n=%u\n", name, klnum_val);
@@ -306,7 +306,7 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 		return 0;
 	}
 
-	for (idx = 0; idx < (int)klnum_val; idx++) {
+	for (idx = 0; idx < (int)klnum_val; ) {
 		const unsigned char *name_start = slide_ptr(&w, slide_buf);
 		int lb = *name_start;
 		int elen = lb;
@@ -317,11 +317,17 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 			hdr = 2;
 		}
 		if ((unsigned int)(hdr + elen) > 256U ||
-		    w.off + hdr + elen > w.chunksz + w.margin) {
-			ks_dbg("[kallrecon] linear: boundary fail idx=%d hdr=%d elen=%d\n",
-				idx, hdr, elen);
-			break;
+		    w.off + hdr + elen > w.valid) {
+			/* the entry extends past the readable part of
+			 * this window: pull in the next window and retry */
+			ks_dbg("[kallrecon] linear: window end idx=%d\n", idx);
+			if (retried ||
+			    slide_advance(&w, (w.valid - w.off) + 4))
+				break;
+			retried = 1;
+			continue;
 		}
+		retried = 0;
 
 		if (!ks_expand_raw(name_start, ti, tt, nbuf, sizeof(nbuf))) {
 			/* a bad token index leaves nbuf partial without the
@@ -362,6 +368,7 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 			ks_dbg("[kallrecon] linear: slide fail idx=%d\n", idx);
 			break;
 		}
+		idx++;
 	}
 
 	ks_dbg("[kallrecon] linear: done idx=%d decoded=%d hit=%d\n",

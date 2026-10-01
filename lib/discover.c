@@ -293,19 +293,28 @@ static int scan_forward(unsigned long start, unsigned long end, int selfrel,
 
 		cand = addr;
 		prev = selfrel ? (s32)v : -1;
+		{
+			unsigned long prev_addr = addr;
 
-		for (;;) {
-			unsigned long ext_addr = slide_addr(&w);
+			for (;;) {
+				unsigned long ext_addr = slide_addr(&w);
 
-			if (ext_addr >= end || len >= KS_RUN_MAX)
-				break;
-			v = *(u32 *)slide_ptr(&w, slide_buf);
-			if (selfrel ? ((s32)v < prev - 4) : ((int)v < prev))
-				break;
-			prev = selfrel ? (s32)v : (int)v;
-			len++;
-			if (slide_advance(&w, 4))
-				break;
+				if (ext_addr >= end || len >= KS_RUN_MAX)
+					break;
+				/* a hole hop moves the window past unreadable
+				 * bytes, the run cannot continue across it */
+				if (len && ext_addr != prev_addr + 4)
+					break;
+				v = *(u32 *)slide_ptr(&w, slide_buf);
+				if (selfrel ? ((s32)v < prev - 4) :
+					      ((int)v < prev))
+					break;
+				prev = selfrel ? (s32)v : (int)v;
+				prev_addr = ext_addr;
+				len++;
+				if (slide_advance(&w, 4))
+					break;
+			}
 		}
 
 		if (len >= KS_RUN_MIN && len > *best_len) {
@@ -383,6 +392,7 @@ static int scan_zerou32_rev(unsigned long start, unsigned long end,
 	unsigned long pos = end;
 	unsigned long cand = 0;
 	int len = 0, prev = 0, head = 0;
+	unsigned long skipped = 0;
 
 	while (pos > start) {
 		unsigned long lo = pos - start > KS_WIN_SIZE ?
@@ -392,8 +402,19 @@ static int scan_zerou32_rev(unsigned long start, unsigned long end,
 
 		if (!n)
 			break;
-		if (safe_read(slide_buf, (void *)lo, n * 4))
-			break;
+		if (safe_read(slide_buf, (void *)lo, n * 4)) {
+			/* unreadable block: the run cannot continue across
+			 * it, commit what was collected and skip the block */
+			if (len >= KS_RUN_MIN &&
+			    rev_commit(cand, len, head, best_cand, best_len))
+				return 1;
+			len = 0;
+			skipped += pos - lo;
+			if (skipped > KS_HOLE_MAX || lo <= start)
+				break;
+			pos = lo;
+			continue;
+		}
 
 		for (i = (int)n - 1; i >= 0; i--) {
 			u32 v = slide_buf[i];
