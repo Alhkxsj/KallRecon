@@ -1,20 +1,6 @@
-# this file is parsed twice: as the build driver (ARCH may be empty in that
-# parse, harmless because only kbuild consumes kallrecon-objs) and again
-# inside kbuild, where ARCH, SRCARCH and auto.conf are all set. the second
-# parse is the one that selects the anchor object.
-#
-# scripts/subarch.include turns `uname -m` x86_64 into SUBARCH=x86, and kbuild
-# then uses `ARCH ?= $(SUBARCH)`, so a native x86_64 build usually has ARCH=x86
-# (an explicit ARCH=x86_64 keeps the full name, but there it is SRCARCH that is
-# canonicalized to x86). ARCH alone therefore misses most x86_64 builds: also
-# accept SRCARCH=x86 with CONFIG_64BIT from auto.conf.
-ifneq ($(filter x86_64,$(ARCH)),)
-ANCHOR := lib/anchor_x86.o
-else ifeq ($(SRCARCH)$(CONFIG_64BIT),x86y)
-ANCHOR := lib/anchor_x86.o
-else
+# one anchor object for both architectures, the variant is selected
+# inside anchor.S
 ANCHOR := lib/anchor.o
-endif
 
 kallrecon-objs := src/main.o lib/core.o lib/access.o lib/discover.o lib/symbol.o lib/slide.o $(ANCHOR) src/verify.o
 test_probe-objs := test/test_main.o test/dbg.o lib/core.o lib/access.o lib/discover.o lib/symbol.o lib/slide.o $(ANCHOR)
