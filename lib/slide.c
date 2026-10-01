@@ -14,7 +14,7 @@
 #ifdef KALLRECON_DEBUG
 #define slide_dbg(fmt, ...) pr_info("[slide] " fmt, ##__VA_ARGS__)
 #else
-#define slide_dbg(fmt, ...) do {} while (0)
+#define slide_dbg(fmt, ...) do { if (0) pr_info("[slide] " fmt, ##__VA_ARGS__); } while (0)
 #endif
 
 #define SLIDE_BUF_WORDS (18 * 1024)

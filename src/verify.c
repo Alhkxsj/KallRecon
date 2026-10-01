@@ -12,6 +12,11 @@
 #include "../lib/core.h"
 #include "verify.h"
 
+/* kernels without the CFI backport (vanilla 5.10) do not define __nocfi */
+#ifndef __nocfi
+#define __nocfi
+#endif
+
 typedef int (*reg_kp_t)(struct kprobe *);
 typedef void (*unreg_kp_t)(struct kprobe *);
 
@@ -111,7 +116,7 @@ void verify_kallsyms(void)
 		strcpy(truth, "(no sprint_symbol_no_offset)");
 
 	int idx = sym_name_at(test_addr, our, sizeof(our));
-	pr_info("[kallrecon] verify: addr->name '%s' %s\n",
+	pr_info("[kallrecon] verify: addr->name [%d] '%s' %s\n", idx,
 		our, strcmp(truth, our) == 0 ? "MATCH" : "MISMATCH");
 
 	unsigned long lookup = kallsyms_name_to_addr("kallsyms_lookup_name");

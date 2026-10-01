@@ -191,8 +191,9 @@ int expand_sym(unsigned int off, char *buf, int max)
 	unsigned char enc[2 + 256];
 	unsigned int len, hdr;
 
-	if (max > 0)
-		buf[0] = '\0';	/* a failed read must not leave stale data */
+	if (max <= 0)
+		return 0;
+	buf[0] = '\0';	/* a failed read must not leave stale data */
 
 	if (safe_read(ti, (void *)klindex_addr, sizeof(ti)))
 		return 0;
@@ -215,8 +216,7 @@ int expand_sym(unsigned int off, char *buf, int max)
 		 * the terminator, drop it so callers never see a stale or
 		 * unterminated buffer
 		 */
-		if (max > 0)
-			buf[0] = '\0';
+		buf[0] = '\0';
 		return 0;
 	}
 	return (int)(hdr + len);
@@ -318,8 +318,15 @@ static unsigned long name_to_addr_linear_locked(const char *name)
 			break;
 		}
 
-		decoded++;
-		ks_expand_raw(name_start, ti, tt, nbuf, sizeof(nbuf));
+		if (!ks_expand_raw(name_start, ti, tt, nbuf, sizeof(nbuf))) {
+			/* a bad token index leaves nbuf partial without the
+			 * terminator, never hand it to strcmp()
+			 */
+			ks_dbg("[kallrecon] linear: decode fail idx=%d\n", idx);
+			nbuf[0] = '\0';
+		} else {
+			decoded++;
+		}
 		{
 			int sample = 0;
 
@@ -437,8 +444,9 @@ int sym_name_at(unsigned long addr, char *buf, int max)
 {
 	int low = 0, high = (int)klnum_val;
 
-	if (max > 0)
-		buf[0] = '\0';
+	if (max <= 0)
+		return -1;
+	buf[0] = '\0';
 	if (!klnum_val)
 		return -1;
 
